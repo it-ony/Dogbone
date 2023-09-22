@@ -14,26 +14,26 @@
 import logging
 import os
 import sys
+import time
+import traceback
+from math import sqrt as sqrt
 from typing import cast
 
 import adsk.core
 import adsk.fusion
-
-import traceback
-
-import time
 from . import dbutils as dbUtils
-from .decorators import eventHandler, parseDecorator
-from math import sqrt as sqrt
-from .DbClasses import DbFace
 from .DbData import DbParams
+from .DogboneUi import DogboneUi
+from .decorators import eventHandler
+from .util import makeNative, reValidateFace
+
+_appPath = os.path.dirname(os.path.abspath(__file__))
 
 # Globals
 _app = adsk.core.Application.get()
 _design: adsk.fusion.Design = cast(adsk.fusion.Design, _app.activeProduct)
 _ui = _app.userInterface
 _rootComp = _design.rootComponent
-_appPath = os.path.dirname(os.path.abspath(__file__))
 
 # TODO: refactor usage of sub path as it breaks the IDE inspections
 _subpath = os.path.join(f"{_appPath}", "py_packages")
@@ -47,15 +47,7 @@ DOGBONE_GROUP = "dogBoneGroup"
 # FACE_ID = 'faceID'
 REV_ID = "revId"
 ID = "id"
-DEBUGLEVEL = logging.NOTSET
-
-calcId = lambda x: hash(
-    x.entityToken
-)  # if x.assemblyContext else str(x.tempId) + ':' + x.body.name
-makeNative = lambda x: x.nativeObject if x.nativeObject else x
-reValidateFace = lambda comp, x: comp.findBRepUsingPoint(
-    x, adsk.fusion.BRepEntityTypes.BRepFaceEntityType, -1.0, False
-).item(0)
+DEBUGLEVEL = logging.DEBUG
 
 COMMAND_ID = "dogboneBtn"
 CONFIG_PATH = os.path.join(_appPath, "defaults.dat")
@@ -81,8 +73,9 @@ class DogboneCommand(object):
         self.selections = None
         self.errorCount = None
 
+        # TODO: check where this is used and find the correct place
         self.faceSelections = adsk.core.ObjectCollection.create()
-        self.param = DbParams()
+
         self.loggingLevels = {
             "Notset": 0,
             "Debug": 10,
@@ -284,222 +277,16 @@ class DogboneCommand(object):
             if returnValue != adsk.core.DialogResults.DialogYes:
                 return
             _design.designType = adsk.fusion.DesignTypes.ParametricDesignType
-        self.read_defaults()
 
-        self.selectedEdges = {}
-        self.selectedFaces = {}
-        self.selectedOccurrences = {}
-
-        inputs: adsk.core.CommandInputs = args.command.commandInputs
-
-        selInput0 = inputs.addSelectionInput(
-            "faceSelect",
-            "Face",
-            "Select a face to apply dogbones to all internal corner edges",
-        )
-        selInput0.tooltip = "Select a face to apply dogbones to all internal corner edges\n*** Select faces by clicking on them. DO NOT DRAG SELECT! ***"
-        selInput0.addSelectionFilter("PlanarFaces")
-        selInput0.setSelectionLimits(1, 0)
-
-        selInput1 = inputs.addSelectionInput(
-            "edgeSelect",
-            "DogBone Edges",
-            "SELECT OR de-SELECT ANY internal edges dropping down FROM a selected face (TO apply dogbones TO",
-        )
-        selInput1.tooltip = "SELECT OR de-SELECT ANY internal edges dropping down FROM a selected face (TO apply dogbones TO)"
-        selInput1.addSelectionFilter("LinearEdges")
-        selInput1.setSelectionLimits(1, 0)
-        selInput1.isVisible = False
-
-        inp = inputs.addValueInput(
-            "toolDia",
-            "Tool Dia               ",
-            _design.unitsManager.defaultLengthUnits,
-            adsk.core.ValueInput.createByString(self.param.toolDiaStr),
-        )
-        inp.tooltip = "Size of the tool with which you'll cut the dogbone."
-
-        offsetInp = inputs.addValueInput(
-            "toolDiaOffset",
-            "Tool diameter offset",
-            _design.unitsManager.defaultLengthUnits,
-            adsk.core.ValueInput.createByString(self.param.toolDiaOffsetStr),
-        )
-        offsetInp.tooltip = "Increases the tool diameter"
-        offsetInp.tooltipDescription = (
-            "Use this to create an oversized dogbone.\n"
-            "Normally set to 0.  \n"
-            "A value of .010 would increase the dogbone diameter by .010 \n"
-            "Used when you want to keep the tool diameter and oversize value separate"
-        )
-
-        modeGroup: adsk.core.GroupCommandInput = inputs.addGroupCommandInput(
-            "modeGroup", "Mode"
-        )
-        modeGroup.isExpanded = self.param.expandModeGroup
-        modeGroupChildInputs = modeGroup.children
-
-        modeRowInput: adsk.core.ButtonRowCommandInput = (
-            modeGroupChildInputs.addButtonRowCommandInput("modeRow", "Mode", False)
-        )
-        modeRowInput.listItems.add(
-            "Static", not self.param.parametric, "resources/staticMode"
-        )
-        modeRowInput.listItems.add(
-            "Parametric", self.param.parametric, "resources/parametricMode"
-        )
-        modeRowInput.tooltipDescription = (
-            "Static dogbones do not move with the underlying component geometry. \n"
-            "\nParametric dogbones will automatically adjust position with parametric changes to underlying geometry. "
-            "Geometry changes must be made via the parametric dialog.\nFusion has more issues/bugs with these!"
-        )
-
-        typeRowInput: adsk.core.ButtonRowCommandInput = (
-            modeGroupChildInputs.addButtonRowCommandInput("dogboneType", "Type", False)
-        )
-        typeRowInput.listItems.add(
-            "Normal Dogbone", self.param.dbType == "Normal Dogbone", "resources/normal"
-        )
-        typeRowInput.listItems.add(
-            "Minimal Dogbone",
-            self.param.dbType == "Minimal Dogbone",
-            "resources/minimal",
-        )
-        typeRowInput.listItems.add(
-            "Mortise Dogbone",
-            self.param.dbType == "Mortise Dogbone",
-            "resources/hidden",
-        )
-        typeRowInput.tooltipDescription = (
-            "Minimal dogbones creates visually less prominent dogbones, but results in an interference fit "
-            "that, for example, will require a larger force to insert a tenon into a mortise.\n"
-            "\nMortise dogbones create dogbones on the shortest sides, or the longest sides.\n"
-            "A piece with a tenon can be used to hide them if they're not cut all the way through the workpiece."
-        )
-
-        mortiseRowInput: adsk.core.ButtonRowCommandInput = (
-            modeGroupChildInputs.addButtonRowCommandInput(
-                "mortiseType", "Mortise Type", False
-            )
-        )
-        mortiseRowInput.listItems.add(
-            "On Long Side", self.param.longSide, "resources/hidden/longSide"
-        )
-        mortiseRowInput.listItems.add(
-            "On Short Side", not self.param.longSide, "resources/hidden/shortside"
-        )
-        mortiseRowInput.tooltipDescription = (
-            "Along Longest will have the dogbones cut into the longer sides."
-            "\nAlong Shortest will have the dogbones cut into the shorter sides."
-        )
-        mortiseRowInput.isVisible = self.param.dbType == "Mortise Dogbone"
-
-        minPercentInp = modeGroupChildInputs.addValueInput(
-            "minimalPercent",
-            "Percentage Reduction",
-            "",
-            adsk.core.ValueInput.createByReal(self.param.minimalPercent),
-        )
-        minPercentInp.tooltip = "Percentage of tool radius added to push out dogBone - leaves actual corner exposed"
-        minPercentInp.tooltipDescription = "This should typically be left at 10%, but if the fit is too tight, it should be reduced"
-        minPercentInp.isVisible = self.param.dbType == "Minimal Dogbone"
-
-        depthRowInput: adsk.core.ButtonRowCommandInput = (
-            modeGroupChildInputs.addButtonRowCommandInput(
-                "depthExtent", "Depth Extent", False
-            )
-        )
-        depthRowInput.listItems.add(
-            "From Selected Face", not self.param.fromTop, "resources/fromFace"
-        )
-        depthRowInput.listItems.add(
-            "From Top Face", self.param.fromTop, "resources/fromTop"
-        )
-        depthRowInput.tooltipDescription = (
-            'When "From Top Face" is selected, all dogbones will be extended to the top most face\n'
-            "\nThis is typically chosen when you don't want to, or can't do, double sided machining."
-        )
-
-        angleDetectionGroupInputs: adsk.core.GroupCommandInput = (
-            inputs.addGroupCommandInput("angleDetectionGroup", "Detection Mode")
-        )
-        angleDetectionGroupInputs.isExpanded = self.param.angleDetectionGroup
-
-        angleDetectionGroupInputs.isVisible = (
-            not self.param.parametric
-        )  # disables angle selection if in parametric mode
-
-        enableAcuteAngleInput: adsk.core.BoolValueCommandInput = (
-            angleDetectionGroupInputs.children.addBoolValueInput(
-                "acuteAngle", "Acute Angle", True, "", self.param.acuteAngle
-            )
-        )
-        enableAcuteAngleInput.tooltip = (
-            "Enables detection of corner angles less than 90"
-        )
-        minAngleSliderInput: adsk.core.FloatSliderCommandInput = (
-            angleDetectionGroupInputs.children.addFloatSliderCommandInput(
-                "minSlider", "Min Limit", "", 10.0, 89.0
-            )
-        )
-        minAngleSliderInput.isVisible = self.param.acuteAngle
-        minAngleSliderInput.valueOne = self.param.minAngleLimit
-
-        enableObtuseAngleInput: adsk.core.BoolValueCommandInput = (
-            angleDetectionGroupInputs.children.addBoolValueInput(
-                "obtuseAngle", "Obtuse Angle", True, "", self.param.obtuseAngle
-            )
-        )  #
-        enableObtuseAngleInput.tooltip = (
-            "Enables detection of corner angles greater than 90"
-        )
-
-        maxAngleSliderInput: adsk.core.FloatSliderCommandInput = (
-            angleDetectionGroupInputs.children.addFloatSliderCommandInput(
-                "maxSlider", "Max Limit", "", 91.0, 170.0
-            )
-        )
-        maxAngleSliderInput.isVisible = self.param.obtuseAngle
-        maxAngleSliderInput.valueOne = self.param.maxAngleLimit
-
-        settingGroup: adsk.core.GroupCommandInput = inputs.addGroupCommandInput(
-            "settingsGroup", "Settings"
-        )
-        settingGroup.isExpanded = self.param.expandSettingsGroup
-        settingGroupChildInputs = settingGroup.children
-
-        benchMark = settingGroupChildInputs.addBoolValueInput(
-            "benchmark", "Benchmark time", True, "", self.param.benchmark
-        )
-        benchMark.tooltip = "Enables benchmarking"
-        benchMark.tooltipDescription = (
-            "When enabled, shows overall time taken to process all selected dogbones."
-        )
-
-        logDropDownInp: adsk.core.DropDownCommandInput = (
-            settingGroupChildInputs.addDropDownCommandInput(
-                "logging",
-                "Logging level",
-                adsk.core.DropDownStyles.TextListDropDownStyle,
-            )
-        )
-        logDropDownInp.tooltip = "Enables logging"
-        logDropDownInp.tooltipDescription = (
-            "Creates a dogbone.log file. \n"
-            f"Location: {os.path.join(_appPath, 'dogBone.log')}"
-        )
-
-        logDropDownInp.listItems.add("Notset", self.param.logging == 0)
-        logDropDownInp.listItems.add("Debug", self.param.logging == 10)
-        logDropDownInp.listItems.add("Info", self.param.logging == 20)
-
+        params = self.read_defaults()
         cmd: adsk.core.Command = args.command
+        ui = DogboneUi(params, args.command, self.logger)
+
         # Add handlers to this command.
-        self.onExecute(event=cmd.execute)
-        # self.onExecutePreview(event=cmd.executePreview)
-        self.onFaceSelect(event=cmd.selectionEvent)
-        self.onValidate(event=cmd.validateInputs)
-        self.onChange(event=cmd.inputChanged)
+        # FIXME: add handlers again
+        # self.onExecute(event=cmd.execute)
+        # self.onFaceSelect(event=cmd.selectionEvent)
+        # self.onValidate(event=cmd.validateInputs)
 
     @eventHandler(handler_cls=adsk.core.CommandEventHandler)
     def onExecutePreview(self, args: adsk.core.CommandEventArgs):
@@ -514,207 +301,6 @@ class DogboneCommand(object):
     #  this is where selection and deselection management takes place
     #  also where eligible edges are determined
     # ==============================================================================
-    @eventHandler(handler_cls=adsk.core.InputChangedEventHandler)
-    @parseDecorator
-    def onChange(self, args: adsk.core.InputChangedEventArgs):
-        changedInput: adsk.core.CommandInput = args.input
-        self.logger.debug(f"input changed- {changedInput.id}")
-
-        if changedInput.id == "dogboneType":
-            changedInput.commandInputs.itemById("minimalPercent").isVisible = (
-                    changedInput.commandInputs.itemById("dogboneType").selectedItem.name
-                    == "Minimal Dogbone"
-            )
-            changedInput.commandInputs.itemById("mortiseType").isVisible = (
-                    changedInput.commandInputs.itemById("dogboneType").selectedItem.name
-                    == "Mortise Dogbone"
-            )
-            return
-
-        if changedInput.id == "toolDia":
-            changedInput: adsk.core.ValueCommandInput
-            self.param.toolDiaStr = changedInput.expression
-            return
-
-        if changedInput.id == "modeRow":
-            changedInput.parentCommand.commandInputs.itemById(
-                "angleDetectionGroup"
-            ).isVisible = (changedInput.selectedItem.name == "Static")
-            self.param.parametric = changedInput.selectedItem.name == "Parametric"  #
-
-        if changedInput.id == "acuteAngle":
-            changedInput.commandInputs.itemById(
-                "minSlider"
-            ).isVisible = changedInput.value
-            self.param.acuteAngle = changedInput.value
-
-        if changedInput.id == "minSlider":
-            self.param.minAngleLimit = changedInput.commandInputs.itemById(
-                "minSlider"
-            ).valueOne
-
-        if changedInput.id == "obtuseAngle":
-            changedInput.commandInputs.itemById(
-                "maxSlider"
-            ).isVisible = changedInput.value
-            self.param.obtuseAngle = changedInput.value
-
-        if changedInput.id == "maxSlider":
-            self.param.maxAngleLimit = changedInput.commandInputs.itemById(
-                "maxSlider"
-            ).valueOne
-
-        #
-        if (
-                changedInput.id == "acuteAngle"
-                or changedInput.id == "obtuseAngle"
-                or changedInput.id == "minSlider"
-                or changedInput.id == "maxSlider"
-                or changedInput.id == "modeRow"
-        ):  # refresh edges after specific input changes
-            edgeSelectCommand = changedInput.parentCommand.commandInputs.itemById(
-                "edgeSelect"
-            )
-            if not edgeSelectCommand.isVisible:
-                return
-            focusState = changedInput.parentCommand.commandInputs.itemById(
-                "faceSelect"
-            ).hasFocus
-            edgeSelectCommand.hasFocus = True
-            [
-                _ui.activeSelections.removeByEntity(edgeObj.edge)
-                for edgeObj in self.selectedEdges.values()
-            ]
-            [faceObj.reSelectEdges() for faceObj in self.selectedFaces.values()]
-            changedInput.parentCommand.commandInputs.itemById(
-                "faceSelect"
-            ).hasFocus = focusState
-            return
-
-        if changedInput.id != "faceSelect" and changedInput.id != "edgeSelect":
-            return
-
-        self.logger.debug(f"input changed- {changedInput.id}")
-        if changedInput.id == "faceSelect":
-            # ==============================================================================
-            #            processing changes to face selections
-            # ==============================================================================
-            if len(self.selectedFaces) > changedInput.selectionCount:
-                # a face has been removed
-
-                # If all faces are removed, just reset registers
-                if changedInput.selectionCount == 0:
-                    self.selectedEdges = {}
-                    self.selectedFaces = {}
-                    self.selectedOccurrences = {}
-                    changedInput.commandInputs.itemById("edgeSelect").clearSelection()
-                    changedInput.commandInputs.itemById("faceSelect").hasFocus = True
-                    changedInput.commandInputs.itemById("edgeSelect").isVisible = False
-                    return
-
-                # Else find the missing face in selection
-                selectionSet = {
-                    hash(changedInput.selection(i).entity.entityToken)
-                    for i in range(changedInput.selectionCount)
-                }
-                missingFaces = set(self.selectedFaces.keys()) ^ selectionSet
-                changedInput.commandInputs.itemById("edgeSelect").isVisible = True
-                changedInput.commandInputs.itemById("edgeSelect").hasFocus = True
-                [
-                    (
-                        self.selectedFaces[
-                            missingFace
-                        ].removeFaceFromSelectedOccurrences(),
-                        self.selectedFaces[missingFace].deleteEdges(),
-                        self.selectedFaces.pop(missingFace),
-                    )
-                    for missingFace in missingFaces
-                ]
-                changedInput.commandInputs.itemById("faceSelect").hasFocus = True
-                return
-
-            # ==============================================================================
-            #             Face has been added - assume that the last selection entity is the one added
-            # ==============================================================================
-            changedInput.commandInputs.itemById("edgeSelect").isVisible = True
-            changedInput.commandInputs.itemById("edgeSelect").hasFocus = True
-
-            selectionDict = {
-                hash(
-                    changedInput.selection(i).entity.entityToken
-                ): changedInput.selection(i).entity
-                for i in range(changedInput.selectionCount)
-            }
-
-            addedFaces = set(self.selectedFaces.keys()) ^ set(
-                selectionDict.keys()
-            )  # get difference -> results in
-
-            for faceId in addedFaces:
-                changedEntity = selectionDict[
-                    faceId
-                ]  # changedInput.selection(changedInput.selectionCount-1).entity
-                activeOccurrenceId = (
-                    hash(changedEntity.assemblyContext.entityToken)
-                    if changedEntity.assemblyContext
-                    else hash(changedEntity.body.entityToken)
-                )
-
-                faces = self.selectedOccurrences.get(activeOccurrenceId, [])
-
-                faces += (
-                    t := [
-                        DbFace(
-                            parent=self,
-                            face=changedEntity,
-                            params=self.param,
-                            commandInputsEdgeSelect=changedInput.commandInputs.itemById(
-                                "edgeSelect"
-                            ),
-                        )
-                    ]
-                )
-                self.selectedOccurrences[
-                    activeOccurrenceId
-                ] = faces  # adds a face to a list of faces associated with this occurrence
-                self.selectedFaces.update({faceObj.faceId: faceObj for faceObj in t})
-                [self.selectedFaces[faceId].selectAll() for faceId in addedFaces]
-                changedInput.commandInputs.itemById("faceSelect").hasFocus = True
-            return
-            # end of processing faces
-        # ==============================================================================
-        #         Processing changed edge selection
-        # ==============================================================================
-
-        if len(self.selectedEdges) > changedInput.selectionCount:
-            # ==============================================================================
-            #             an edge has been removed
-            # ==============================================================================
-
-            changedSelectionList = [
-                changedInput.selection(i).entity
-                for i in range(changedInput.selectionCount)
-            ]
-            changedEdgeIdSet = set(
-                map(calcId, changedSelectionList)
-            )  # converts list of edges to a list of their edgeIds
-            missingEdges = set(self.selectedEdges.keys()) - changedEdgeIdSet
-            [self.selectedEdges[missingEdge].deselect for missingEdge in missingEdges]
-            # Note - let the user manually unselect the face if they want to choose a different face
-
-            return
-            # End of processing removed edge
-        else:
-            # ==============================================================================
-            #         Start of adding a selected edge
-            #         Edge has been added - assume that the last selection entity is the one added
-            # ==============================================================================
-            edge: adsk.fusion.BRepEdge = changedInput.selection(
-                changedInput.selectionCount - 1
-            ).entity
-            self.selectedEdges[
-                calcId(edge)
-            ].select  # Get selectedFace then get selectedEdge, then call function
 
     def parseInputs(self, cmdInputs):
         """==============================================================================
@@ -900,8 +486,7 @@ class DogboneCommand(object):
     ################################################################################
     @eventHandler(handler_cls=adsk.core.ValidateInputsEventHandler)
     def onValidate(self, args):
-        cmd: adsk.core.ValidateInputsEventArgs = args
-        cmd = args.firingEvent.sender
+        cmd: adsk.core.ValidateInputsEventArgs = args.firingEvent.sender
 
         for input in cmd.commandInputs:
             if input.id == "faceSelect":
@@ -985,7 +570,7 @@ class DogboneCommand(object):
                 return
 
             if (
-                activeOccurrenceId not in self.selectedOccurrences
+                    activeOccurrenceId not in self.selectedOccurrences
             ):  # check if mouse is over a face that is not already selected
                 eventArgs.isSelectable = False
                 return
@@ -1003,7 +588,7 @@ class DogboneCommand(object):
                 return
             primaryFaceNormal = dbUtils.getFaceNormal(primaryFace.face)
             if primaryFaceNormal.isParallelTo(
-                dbUtils.getFaceNormal(eventArgs.selection.entity)
+                    dbUtils.getFaceNormal(eventArgs.selection.entity)
             ):
                 eventArgs.isSelectable = True
                 return
